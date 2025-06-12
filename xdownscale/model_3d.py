@@ -222,3 +222,168 @@ class CARN3D(nn.Module):
         out = self.exit(x4)
         return out
 
+class FALSR_A3D(nn.Module):
+    def __init__(self, in_channels=1, upscale_factor=1):
+        super(FALSR_A3D, self).__init__()
+
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv1 = nn.Conv3d(in_channels, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.conv4 = nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.conv5 = nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.conv6 = nn.Conv3d(32, in_channels * (upscale_factor ** 3), kernel_size=3, stride=1, padding=1)
+
+        self.pixel_shuffle = PixelShuffle3D(upscale_factor)
+
+    def forward(self, x):
+        x1 = self.relu(self.conv1(x))
+        x2 = self.relu(self.conv2(x1))
+        x3 = self.relu(self.conv3(x2))
+        x4 = self.relu(self.conv4(x3))
+        x5 = self.relu(self.conv5(x4))
+        x6 = self.pixel_shuffle(self.conv6(x5))
+        return x6
+
+class OISRRK2_3D(nn.Module):
+    def __init__(self, in_channels=1, upscale_factor=1):
+        super(OISRRK2_3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1)
+        self.conv4 = nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1)
+        self.conv5 = nn.Conv3d(64, in_channels * (upscale_factor ** 3), kernel_size=3, stride=1, padding=1)
+        self.upscale_factor = upscale_factor
+        self.pixel_shuffle = PixelShuffle3D(upscale_factor)
+
+    def forward(self, x):
+        res1 = F.relu(self.conv1(x))
+        res2 = F.relu(self.conv2(res1))
+        res3 = F.relu(self.conv3(res2))
+        res4 = F.relu(self.conv4(res3))
+        res5 = self.conv5(res4)
+        out = self.pixel_shuffle(res5) + x
+        return out
+
+class ResidualBlock3D_BN(nn.Module):
+    def __init__(self, in_channels):
+        super(ResidualBlock3D_BN, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(in_channels)
+        self.prelu = nn.PReLU()
+        self.conv2 = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(in_channels)
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.prelu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        return x + residual
+
+class MDSR3D(nn.Module):
+    def __init__(self, in_channels, upscale_factor, num_blocks):
+        super(MDSR3D, self).__init__()
+        self.input_conv = nn.Conv3d(in_channels, 64, kernel_size=3, padding=1)
+        self.prelu = nn.PReLU()
+        self.residual_blocks = nn.Sequential(*[ResidualBlock3D_BN(64) for _ in range(num_blocks)])
+        self.output_conv = nn.Conv3d(64, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x1 = self.input_conv(x)
+        x1 = self.prelu(x1)
+        x2 = self.residual_blocks(x1)
+        x3 = self.output_conv(x2)
+        return x + x3
+
+class SecondOrderChannelAttention3D(nn.Module):
+    def __init__(self, in_channels):
+        super(SecondOrderChannelAttention3D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // 16, in_channels)
+        )
+
+    def forward(self, x):
+        b, c, _, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1, 1)
+        return x * torch.sigmoid(y)
+
+class SAN3D(nn.Module):
+    def __init__(self, in_channels, upscale_factor, num_blocks, num_heads):
+        super(SAN3D, self).__init__()
+
+        self.input_conv = nn.Conv3d(in_channels, 64, kernel_size=3, padding=1)
+        self.prelu = nn.PReLU()
+
+        self.residual_blocks = nn.Sequential(
+            *[ResidualBlock3D_BN(64) for _ in range(num_blocks)]
+        )
+
+        self.attention_blocks = nn.Sequential(
+            *[SecondOrderChannelAttention3D(64) for _ in range(num_heads)]
+        )
+
+        self.output_conv = nn.Conv3d(64, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x1 = self.input_conv(x)
+        x1 = self.prelu(x1)
+
+        x2 = self.residual_blocks(x1)
+        x3 = self.attention_blocks(x2)
+        x4 = self.output_conv(x3)
+
+        return x + x4
+
+
+class ResidualChannelAttentionBlock3D(nn.Module):
+    def __init__(self, n_feat, kernel_size=3, reduction=16, bias=True, bn=False, act=nn.ReLU(True), res_scale=1):
+        super(ResidualChannelAttentionBlock3D, self).__init__()
+        modules_body = []
+        for _ in range(2):
+            modules_body.append(nn.Conv3d(n_feat, n_feat, kernel_size, padding=1, bias=bias))
+            if bn: modules_body.append(nn.BatchNorm3d(n_feat))
+            modules_body.append(act)
+        modules_body.pop()  # remove last activation
+        self.body = nn.Sequential(*modules_body)
+
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(n_feat, n_feat // reduction, 1, padding=0, bias=bias),
+            act,
+            nn.Conv3d(n_feat // reduction, n_feat, 1, padding=0, bias=bias),
+            nn.Sigmoid()
+        )
+        self.res_scale = res_scale
+
+    def forward(self, x):
+        res = self.body(x)
+        res = self.ca(res) * res
+        res += x
+        return res
+
+class RCAN3D(nn.Module):
+    def __init__(self, in_channels, num_blocks, upscale_factor):
+        super(RCAN3D, self).__init__()
+        self.input_conv = nn.Conv3d(in_channels, 64, kernel_size=3, padding=1)
+        self.prelu = nn.PReLU()
+        self.residual_blocks = nn.Sequential(
+            *[ResidualChannelAttentionBlock3D(64) for _ in range(num_blocks)]
+        )
+        self.output_conv = nn.Conv3d(64, in_channels * (upscale_factor ** 3), kernel_size=3, padding=1)
+        self.pixel_shuffle = PixelShuffle3D(upscale_factor)
+
+    def forward(self, x):
+        x1 = self.input_conv(x)
+        x1 = self.prelu(x1)
+        x2 = self.residual_blocks(x1)
+        x3 = self.output_conv(x2)
+        x4 = self.pixel_shuffle(x3)
+        return x4
