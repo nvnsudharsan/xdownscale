@@ -774,3 +774,87 @@ class SE_net3D(nn.Module):
         o1 = F.relu(self.fc1(o1))
         o1 = self.fc2(o1)
         return o1
+
+class size_selector3D(nn.Module):
+    def __init__(self, in_channels, intermediate_channels, out_channels):
+        super(size_selector3D, self).__init__()
+        self.embedding = nn.Sequential(
+            nn.Linear(in_features=in_channels, out_features=intermediate_channels),
+            nn.BatchNorm1d(intermediate_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.selector_a = nn.Linear(in_features=intermediate_channels, out_features=out_channels)
+        self.selector_b = nn.Linear(in_features=intermediate_channels, out_features=out_channels)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        vector = x.mean(-1).mean(-1).mean(-1)
+        o1 = self.embedding(vector)
+        a = self.selector_a(o1)
+        b = self.selector_b(o1)
+        v = torch.cat((a, b), dim=1)
+        v = self.softmax(v)
+        a = v[:, 0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        b = v[:, 1].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return a, b
+
+
+class Get_gradient3D(nn.Module):
+    def __init__(self):
+        super(Get_gradient3D, self).__init__()
+        self.kernel = torch.tensor([[[[0, -1, 0], [0, 0, 0], [0, 1, 0]],
+                                     [[0, -1, 0], [0, 0, 0], [0, 1, 0]],
+                                     [[0, -1, 0], [0, 0, 0], [0, 1, 0]]]], dtype=torch.float32)
+        self.weight = nn.Parameter(self.kernel.unsqueeze(0), requires_grad=False)
+
+    def forward(self, x):
+        x0 = x[:, 0]
+        grad = F.conv3d(x0.unsqueeze(1), self.weight.cuda(), padding=1)
+        return torch.sqrt(torch.sum(grad**2, dim=1, keepdim=True) + 1e-6)
+
+
+class ADAM3D(nn.Module):
+    def __init__(self, channel, angRes):
+        super(ADAM3D, self).__init__()
+        self.conv_1 = nn.Conv3d(channel * 2, channel, kernel_size=1, stride=1, padding=0)
+        self.ASPP = ResASPP3D(channel)
+        self.conv_f1 = nn.Conv3d(angRes * angRes * channel, angRes * angRes * channel, kernel_size=1, stride=1, padding=0)
+        self.conv_f3 = nn.Conv3d(2 * channel, channel, kernel_size=1, stride=1, padding=0)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+
+    def forward(self, x):
+        x_cv = x[:, 12, :, :, :, :]
+        x_sv_part1 = x[:, 0:12, :, :, :, :]
+        x_sv_part2 = x[:, 13:25, :, :, :, :]
+        x_sv = torch.cat([x_sv_part1, x_sv_part2], dim=1)
+
+        b, n, c, d, h, w = x_sv.shape
+        aligned_fea = []
+        for i in range(n):
+            current_sv = x_sv[:, i, :, :, :, :].contiguous()
+            buffer = torch.cat((current_sv, x_cv), dim=1)
+            buffer = self.lrelu(self.conv_1(buffer))
+            buffer = self.ASPP(buffer)
+            aligned_fea.append(buffer)
+        aligned_fea = torch.cat(aligned_fea, dim=1)
+        fea_collect = torch.cat((aligned_fea, x_cv), 1)
+        fuse_fea = self.conv_f1(fea_collect)
+        fuse_fea = fuse_fea.view(b, -1, c, d, h, w)
+
+        out_sv = []
+        for i in range(n):
+            current_sv = x_sv[:, i, :, :, :, :].contiguous()
+            current_fuse = fuse_fea[:, i + 1, :, :, :, :].contiguous()
+            buffer = torch.cat((current_fuse, current_sv), dim=1)
+            buffer = self.lrelu(self.conv_1(buffer))
+            buffer = self.ASPP(buffer)
+            fuse_sv = torch.cat((current_sv, buffer), dim=1)
+            fuse_sv = self.conv_f3(fuse_sv)
+            out_sv.append(fuse_sv)
+        out_sv = torch.stack(out_sv, dim=1)
+        out_cv = self.conv_f3(torch.cat((x_cv, fuse_fea[:, 0, :, :, :, :]), 1))
+        out = FormOutput_ADAM3D(out_sv, out_cv)
+
+        return out
+
+
