@@ -80,17 +80,17 @@ class Downscaler:
             raise ValueError(f"Unknown model name: {name}")
 
     def _train(self, val_split, test_split, model_name):
-        if self.use_wandb:
-            wandb.init(
-                project="xdownscale",
-                name=f"{model_name.upper()}_run",
-                config={
-                    "model": model_name,
-                    "epochs": self.epochs,
-                    "batch_size": self.batch_size,
-                    "patch_size": self.patch_size
-                }
-            )
+ #       if self.use_wandb:
+ #           wandb.init(
+ #               project="xdownscale",
+ #               name=f"{model_name.upper()}_run",
+ #               config={
+ #                   "model": model_name,
+ #                   "epochs": self.epochs,
+ #                   "batch_size": self.batch_size,
+ #                   "patch_size": self.patch_size
+ #               }
+ #           )
 
         x = self.input_da.values.astype(np.float32)
         y = self.target_da.values.astype(np.float32)
@@ -148,7 +148,6 @@ class Downscaler:
             if epoch % 10 == 0 or epoch == self.epochs - 1:
                 print(f"[{epoch}] Train: {train_loss:.4f} | Val: {val_loss:.4f}")
 
-            # Early stopping with best model saving
             if val_loss < best_val_loss - self.min_delta:
                 best_val_loss = val_loss
                 best_model_state = copy.deepcopy(self.model.state_dict())
@@ -159,13 +158,12 @@ class Downscaler:
                     print(f"Early stopping at epoch {epoch} with best val_loss: {best_val_loss:.4f}")
                     break
 
-        # Restore best model
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
 
         self.test_loader = test_loader
-        if self.use_wandb:
-            wandb.finish()
+       # if self.use_wandb:
+       #     wandb.finish()
 
     def predict(self, input_da: xr.DataArray, use_patches: bool = True) -> xr.DataArray:
         x_input = (input_da.values / self.x_max).astype(np.float32)
@@ -177,7 +175,7 @@ class Downscaler:
                 x_tensor = torch.from_numpy(patches[:, None, :, :]).to(self.device)
                 preds = self.model(x_tensor).cpu().numpy()[:, 0, :, :] * self.y_max
                 preds[preds < 0] = 0.0
-                reconstructed = unpatchify(preds, x_input.shape)
+                reconstructed = unpatchify(preds, x_input.shape[-2:], self.patch_size)
             else:
                 x_tensor = torch.from_numpy(x_input[None, None, :, :]).to(self.device)
                 pred = self.model(x_tensor).cpu().numpy()[0, 0, :, :] * self.y_max
